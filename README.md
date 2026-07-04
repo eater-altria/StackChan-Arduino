@@ -66,7 +66,8 @@ cp .env.example .env
 #     或新版控制台用 DOUBAO_API_KEY 单项）——需开通「流式语音识别大模型」和
 #     「语音合成大模型2.0」两个服务
 #   DOUBAO_TTS_SPEAKER    —— TTS 音色 ID（火山控制台音色库选取，必填）
-# 可选：HA_MCP_URL —— Home Assistant MCP 地址（配置后可语音控制家居/外部音箱播报）
+# 可选：HA_MCP_URL —— Home Assistant MCP 地址（配置后可语音控制家居/外部音箱播报，
+#   MCP 服务端安装见 assistant-server/README.md「智能家居」一节）
 npm start
 # → StackChan assistant-server 监听 :8300
 ```
