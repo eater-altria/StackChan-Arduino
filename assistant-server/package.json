@@ -1,0 +1,19 @@
+{
+  "name": "stackchan-assistant-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "StackChan 语音助手后端：收机器人录音 → OpenAI STT → LLM → TTS → 返回 PCM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "openai": "^6.0.0",
+    "ws": "^8.21.0"
+  }
+}
