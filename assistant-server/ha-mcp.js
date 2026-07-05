@@ -95,7 +95,7 @@ const CATALOG_DOMAINS = [
   'vacuum', 'humidifier', 'lock', 'light', 'switch',
 ];
 const CATALOG_TTL_MS = 10 * 60 * 1000;
-const CATALOG_MAX_CHARS = 12000;
+const CATALOG_MAX_CHARS = Number(process.env.HA_CATALOG_MAX_CHARS) || 16000;
 // 指示灯/信号灯类条目没人语音控制，还会教模型拿它冒充主设备，一律不进清单
 const JUNK_RE = /indicator_light|指示灯/i;
 let catalogText = '';
@@ -209,6 +209,33 @@ export async function haMediaPlay(entityId) {
     name: 'ha_call_service',
     arguments: { domain: 'media_player', service: 'media_play', entity_id: entityId, wait: false },
   });
+}
+
+/**
+ * 读 media_player 播放进度（精准刹车用）。
+ * 返回 { state, positionMs, durationMs, updatedAt }，字段拿不到时为 null。
+ */
+export async function haGetPlayback(entityId) {
+  if (!client) throw new Error('Home Assistant 未连接');
+  const res = await client.callTool({
+    name: 'ha_get_state',
+    arguments: {
+      entity_id: entityId,
+      fields: ['state', 'attributes'],
+      attribute_keys: ['media_position', 'media_duration', 'media_position_updated_at'],
+    },
+  });
+  const text = (res.content || []).map(c => (c.type === 'text' ? c.text : '')).join('');
+  if (res.isError) throw new Error(`ha_get_state 失败: ${text.slice(0, 200)}`);
+  const data = JSON.parse(text)?.data || {};
+  const attrs = data.attributes || {};
+  const num = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return {
+    state: data.state ?? null,
+    positionMs: num(attrs.media_position) !== null ? attrs.media_position * 1000 : null,
+    durationMs: num(attrs.media_duration) !== null ? attrs.media_duration * 1000 : null,
+    updatedAt: attrs.media_position_updated_at ? Date.parse(attrs.media_position_updated_at) : null,
+  };
 }
 
 /** 执行一次工具调用，返回给模型的文本结果（出错也返回文本，让模型能向用户解释） */

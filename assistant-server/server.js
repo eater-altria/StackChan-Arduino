@@ -27,6 +27,7 @@ import {
   haPlayMedia,
   haMediaPause,
   haMediaPlay,
+  haGetPlayback,
   haCatalog,
 } from './ha-mcp.js';
 import { doubaoInit, doubaoTranscribe, doubaoSynthesize, doubaoSynthesizeStream } from './doubao.js';
@@ -162,15 +163,23 @@ function pcmToWav(pcm, sampleRate) {
   return Buffer.concat([header, pcm]);
 }
 
-// ── 推送到音箱 + 定时刹车 ─────────────────────────────────────────
-// 实测（小米音箱）：repeat=all 且不支持 repeat_set/announce → 单曲无限循环。
-// 对策：①WAV 尾部拼 SILENCE_PAD_MS 静音——循环重播的开头是无声区；
-//      ②在「语音时长 + PAUSE_AFTER_MS」定时 media_pause。只要音箱拉流延迟
-//      不超过 PAUSE_AFTER_MS，暂停必然切在静音里，用户听到的永远是完整一遍。
-//      （曾只留 2.5s 余量：正片播完循环立刻重启，暂停切在第二遍中间）
-const SILENCE_PAD_MS = 6000;
-const PAUSE_AFTER_MS = 3000;
-const speakerTimers = new Map(); // entityId → timeout
+// ── 推送到音箱 + 播完刹车 ─────────────────────────────────────────
+// 实测（小米音箱 L17A）：repeat=all 循环关不掉（无 REPEAT_SET 能力位，miot 的
+// play_loop_mode 属性读了报 Invalid IID），不支持 announce → 单曲无限循环，
+// 播完一遍必须主动 media_pause。
+// 对策：①WAV 尾部拼静音垫（padMsFor）——循环重播的开头是无声区；
+//      ②语音应播完后轮询 HA 的 media_position，确认正片真播完才刹车
+//      （盲挂钟定时对长音频不可靠：云端启动延迟+流播卡顿的误差随时长累积）；
+//      查不到进度时退回「语音时长 + pauseAfterMsFor」的挂钟兜底。
+// 长音频拉流中途的缓冲/卡顿会让播放进度落后于挂钟，误差随时长累积，
+// 静音垫和暂停余量都按语音时长的 10% 追加。
+// 基础余量 8s：覆盖最坏启动延迟（实测小米云 play_media 到出声可达 4s+）；
+// 静音垫始终比余量大 8s，挂钟刹车点必然落在垫内且远离循环重启点
+const SILENCE_PAD_BASE_MS = 16000;
+const PAUSE_AFTER_BASE_MS = 8000;
+const STALL_RATIO = 0.1;
+const padMsFor = speechMs => SILENCE_PAD_BASE_MS + Math.round(speechMs * STALL_RATIO);
+const pauseAfterMsFor = speechMs => PAUSE_AFTER_BASE_MS + Math.round(speechMs * STALL_RATIO);
 // 音箱是否处于「被我们防循环暂停」的状态。小米云把每次 URL 推送视作同一个媒体位，
 // 在这个 paused 状态下 play_media 会被整个无视（回答推到了却不出声）——
 // 必须先 media_play 唤醒（暂停点落在静音垫里，唤醒是无声的）再替换。
@@ -181,31 +190,107 @@ const pausedByUs = entityId => speakerPausedByUs.get(entityId) ?? true;
 
 /** PCM 尾部拼静音后包成 WAV（配合定时暂停消除循环重播） */
 function wavWithSilencePad(pcm) {
-  const pad = Buffer.alloc(Math.round((TTS_SAMPLE_RATE * 2 * SILENCE_PAD_MS) / 1000));
+  const speechMs = (pcm.length / 2 / TTS_SAMPLE_RATE) * 1000;
+  const pad = Buffer.alloc(Math.round((TTS_SAMPLE_RATE * 2 * padMsFor(speechMs)) / 1000));
   return pcmToWav(Buffer.concat([pcm, pad]), TTS_SAMPLE_RATE);
 }
 
+const speakerPushSeq = new Map(); // entityId → 推送序号，防旧推送的刹车暂停新推送
+const speakerPauseSentAt = new Map(); // entityId → 最近一次 media_pause 请求发出时刻
+const speakerAnswerPushAt = new Map(); // entityId → 最近一次「回答」推送时刻
+// 回答刚推出去几秒内又收到 /prompt/play，几乎必是机器人假唤醒（实测：唤醒模型
+// 会被音箱里的 TTS 音色误触发/麦克风恢复瞬间误报，且随后无人声、无 /chat 跟进），
+// 若照推会用「我在听」覆盖刚开播的回答——此窗口内直接拒推
+const PROMPT_SUPPRESS_MS = 5000;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// wait:false 的服务调用「请求返回」≠「效果落地」，效果经小米云要迟 1~3s。
+// 刚发过 pause 就推新媒体时，迟到的暂停效果可能把刚开播的新媒体按停，需补救
+const PAUSE_EFFECT_LAG_MS = 4000;
+
+// 每台音箱一条操作串行队列：推送（唤醒+play_media）与刹车（media_pause）排队执行，
+// 执行前核对推送序号。没有它，旧刹车的 pause 可能与新推送的 play_media 并发交错，
+// 把刚推上去的回答按停（曾表现为「音箱只播我在听，听不到回答」）
+const speakerOps = new Map(); // entityId → Promise
+function enqueueSpeakerOp(entityId, fn) {
+  const chained = (speakerOps.get(entityId) ?? Promise.resolve()).then(fn);
+  speakerOps.set(entityId, chained.catch(() => {})); // 队列不因单个操作失败而断
+  return chained;
+}
+
+/**
+ * 播完刹车。基线 = 挂钟：play_media 返回后等「语音时长 + 保守余量」再 media_pause，
+ * 余量覆盖最坏启动延迟，刹车点必然落在静音垫内。
+ * 进度轮询只用来「推迟」刹车（云端上报的位置 ≤ 实际位置，偏晚方向安全），
+ * 绝不用来提前——跨机器时钟外推不可信（曾因本机与 HA 时钟偏差把刹车切进正片）。
+ */
+async function brakeWhenSpeechDone(entityId, speechMs, tag, seq) {
+  const startAt = Date.now();
+  // 再晚循环第二遍就出声了：垫比余量大 8s，硬限扣 2s 仍在垫内
+  const hardStopAt = startAt + speechMs + padMsFor(speechMs) - 2000;
+  await sleep(speechMs + pauseAfterMsFor(speechMs));
+  let lastPos = -1;
+  while (speakerPushSeq.get(entityId) === seq && Date.now() < hardStopAt) {
+    let pb = null;
+    try {
+      pb = await haGetPlayback(entityId);
+    } catch { /* 查询失败按无进度处理 */ }
+    // 小米音箱 state_updater=cloud，快照可能滞后——updated_at 早于本次 play_media
+    // 的是上一段媒体的残留（曾据此误判「已被暂停」导致永不刹车），不新鲜就按挂钟刹
+    const fresh = pb?.updatedAt != null && pb.updatedAt >= startAt - 1000;
+    if (!fresh || pb.positionMs == null) break;
+    // 播的不是我们的 WAV（时长对不上）或已被用户暂停/接管 → 不抢刹车
+    if (pb.durationMs != null && Math.abs(pb.durationMs - (speechMs + padMsFor(speechMs))) > 5000) return;
+    if (pb.state !== 'playing') return;
+    if (pb.positionMs < lastPos - 2000) break; // 进度回卷 = 已循环第二遍，立即刹
+    lastPos = pb.positionMs;
+    if (pb.positionMs >= speechMs) break; // 云端确认正片已播完
+    // 云端说还在正片（卡顿把播放拖慢了）→ 推迟刹车再确认；但绝不睡过硬限，
+    // 否则循环第二遍开播（曾因此把第二遍正片播出来才刹住）
+    const maxSleep = hardStopAt - Date.now();
+    if (maxSleep <= 0) break;
+    await sleep(Math.min(maxSleep, Math.max(1000, Math.min(3000, speechMs - pb.positionMs + 1000))));
+  }
+  // pause 进串行队列，真正执行前再核对序号——期间若来了新推送，这脚刹车作废
+  await enqueueSpeakerOp(entityId, async () => {
+    if (speakerPushSeq.get(entityId) !== seq) return;
+    speakerPauseSentAt.set(entityId, Date.now());
+    await haMediaPause(entityId);
+    speakerPausedByUs.set(entityId, true);
+    console.log(
+      `[${tag}] 已刹车（正片 ${(speechMs / 1000).toFixed(1)}s，` +
+        `云端进度 ${lastPos >= 0 ? (lastPos / 1000).toFixed(1) + 's' : '无（纯挂钟）'}，` +
+        `播后 ${((Date.now() - startAt) / 1000).toFixed(1)}s）`,
+    );
+  });
+}
+
 function pushToSpeaker(entityId, url, speechMs, tag) {
-  clearTimeout(speakerTimers.get(entityId));
-  const needWake = pausedByUs(entityId);
-  (async () => {
-    if (needWake) {
+  const seq = (speakerPushSeq.get(entityId) ?? 0) + 1;
+  speakerPushSeq.set(entityId, seq);
+  enqueueSpeakerOp(entityId, async () => {
+    if (speakerPushSeq.get(entityId) !== seq) return; // 排队期间已有更新的推送
+    if (pausedByUs(entityId)) {
       // 先唤醒再替换（顺序不能反！paused 时 play_media 会被小米云无视）。
-      // 上次暂停点必然落在 6s 静音垫内，这 0.5s 的恢复播放是无声的
+      // 上次暂停点必然落在静音垫内，这 0.5s 的恢复播放是无声的
       await haMediaPlay(entityId);
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await sleep(500);
     }
     await haPlayMedia(entityId, url); // playing 状态下替换媒体，实测可靠
     speakerPausedByUs.set(entityId, false);
-  })().catch(e => console.error(`[${tag}] 推送音箱失败:`, e?.message || e));
-  speakerTimers.set(
-    entityId,
-    setTimeout(() => {
-      haMediaPause(entityId)
-        .then(() => speakerPausedByUs.set(entityId, true))
-        .catch(e => console.error(`[${tag}] 定时暂停失败:`, e?.message || e));
-    }, speechMs + PAUSE_AFTER_MS + (needWake ? 500 : 0)),
-  );
+    // 几秒内刚发过 media_pause：其效果可能迟于本次 play_media 落地、把新媒体按停。
+    // 延时补一脚 media_play 救回（若未被按停，对 playing 中的设备是无害空操作）
+    if (Date.now() - (speakerPauseSentAt.get(entityId) ?? 0) < PAUSE_EFFECT_LAG_MS) {
+      await sleep(2000);
+      if (speakerPushSeq.get(entityId) !== seq) return;
+      await haMediaPlay(entityId);
+      console.log(`[${tag}] 补救：撞上迟到的暂停效果，已补 media_play`);
+    }
+  })
+    .then(() => {
+      if (speakerPushSeq.get(entityId) !== seq) return; // 期间来了新推送，刹车交给它
+      return brakeWhenSpeechDone(entityId, speechMs, tag, seq);
+    })
+    .catch(e => console.error(`[${tag}] 推送/刹车失败:`, e?.message || e));
 }
 function lanIP() {
   if (process.env.AUDIO_BASE_URL) return null; // 用户显式指定了基地址
@@ -445,7 +530,30 @@ const server = http.createServer(async (req, res) => {
       res.end('{"error":"not found"}');
       return;
     }
-    res.writeHead(200, { 'Content-Type': a.mime, 'Content-Length': a.buf.length });
+    // 长文件播放器常中途发 Range 续拉，不支持 206 会被从头喂全量导致播放中断
+    const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (m && (m[1] || m[2])) {
+      const start = m[1] ? parseInt(m[1], 10) : Math.max(0, a.buf.length - parseInt(m[2], 10));
+      const end = m[1] && m[2] ? Math.min(parseInt(m[2], 10), a.buf.length - 1) : a.buf.length - 1;
+      if (start >= a.buf.length || start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${a.buf.length}` });
+        res.end();
+        return;
+      }
+      res.writeHead(206, {
+        'Content-Type': a.mime,
+        'Content-Length': end - start + 1,
+        'Content-Range': `bytes ${start}-${end}/${a.buf.length}`,
+        'Accept-Ranges': 'bytes',
+      });
+      res.end(a.buf.subarray(start, end + 1));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': a.mime,
+      'Content-Length': a.buf.length,
+      'Accept-Ranges': 'bytes',
+    });
     res.end(a.buf);
     return;
   }
@@ -456,6 +564,13 @@ const server = http.createServer(async (req, res) => {
     const tp = Date.now();
     try {
       if (outputConfig.mode === 'ha' && outputConfig.entityId && haEnabled()) {
+        const sinceAnswer = Date.now() - (speakerAnswerPushAt.get(outputConfig.entityId) ?? 0);
+        if (sinceAnswer < PROMPT_SUPPRESS_MS) {
+          console.warn(`[prompt] 疑似假唤醒（距回答推送仅 ${sinceAnswer}ms），拒推提示音保回答`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{"remote":true}'); // 机器人照常进入聆听，只是不出提示音
+          return;
+        }
         if (!promptAudioCache) {
           promptAudioCache = await synthesize(CONFIG.promptText);
         }
@@ -531,6 +646,7 @@ const server = http.createServer(async (req, res) => {
         const tPush = Date.now();
         // 即发即走：不等音箱开始播放就先放机器人回 idle；播完一遍定时刹车防循环
         pushToSpeaker(outputConfig.entityId, url, durMs, deviceId);
+        speakerAnswerPushAt.set(outputConfig.entityId, Date.now());
         res.writeHead(200, {
           'Content-Type': 'application/octet-stream',
           'Content-Length': 0,
