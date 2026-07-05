@@ -30,7 +30,7 @@ StackChan 的 **Arduino 版固件**，从零开发，与 ESP-IDF 版的 `firmwar
 `hardware-Arduino.ino` + `wifi_ble.h/.cpp`：
 - 上电舵机原点校准（loading 动画），随后字符画眼睛 idle 随机眨眼；
 - esp-sr **WakeNet** 唤醒词「**Hi 瓦力**」(`wn9_hiwalle_tts2`，官方训练模型，免调阈值)，
-  听到后眨眼、随即进入语音对话（曾用 MultiNet 自定义「海丽海丽」，识别率不够已弃用，过程见 WAKEWORD-A 文档）；
+  听到后眨眼、随即进入语音对话；
 - **BLE Wi-Fi 配网**：开机广播 `StackChan-XXXX`，配套手机 App（**`../app-RN/`**，React Native）
   连上后可让机器人扫描 Wi-Fi、下发密码联网；凭据存 NVS，开机自动重连；
   **语音助手服务器地址**也由 App 经 BLE 配置（SERVER 命令）；
@@ -60,9 +60,8 @@ StackChan 的 **Arduino 版固件**，从零开发，与 ESP-IDF 版的 `firmwar
 
 - [x] 阶段 1：字符画眨眼眼睛
 - [x] 阶段 2：麦克风采集 + 音量阈值验证
-- [x] 阶段 3：本地唤醒词 —— 最终用 **WakeNet「Hi 瓦力」**
-      - 方案 A（MultiNet 拼音 `hai li hai li`，[WAKEWORD-A-espsr.md](WAKEWORD-A-espsr.md)）：已跑通但识别率不足（prob≈0.49），弃用；换模型/打包步骤仍然有效
-      - 方案 C（备选，[WAKEWORD.md](WAKEWORD.md)）：Edge Impulse + TFLite 自训关键词，未采用
+- [x] 阶段 3：本地唤醒词 —— **WakeNet 预置模型「Hi 瓦力」**（`wn9_hiwalle_tts2`，
+      重打 srmodels.bin 步骤见 [WAKEWORD-A-espsr.md](WAKEWORD-A-espsr.md)）
 - [x] 舵机头部运动（开机原点校准，M5StackChan 库；唤醒点头已按需求移除）
 - [x] WiFi / 联网能力（BLE 配网，配套 **`../app-RN/`** 手机 App；右滑看 Wi-Fi 信息）
 - [x] 语音助手（唤醒→倾听→电脑端 **`../assistant-server/`**（OpenAI）→扬声器播报）
@@ -71,4 +70,4 @@ StackChan 的 **Arduino 版固件**，从零开发，与 ESP-IDF 版的 `firmwar
 
 ## 工具 / 子工程
 
-- [`tools/sr_model_check/`](tools/sr_model_check/) —— esp-sr `model` 分区诊断（方案 A 第 1 步），独立 sketch，查 flash 里有没有中文 MultiNet 模型。
+- [`tools/sr_model_check/`](tools/sr_model_check/) —— esp-sr `model` 分区诊断（WAKEWORD-A 步骤 1），独立 sketch，列出 flash 里现有的 esp-sr 模型。
